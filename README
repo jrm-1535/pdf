@@ -1,0 +1,8 @@
+#pdf
+
+A pdf document parsing and modifying library
+
+The libary provides functions to parse and show elements in PDF documents.
+It checks the validity of PDF files and allow fixing some common small errors
+(incorrect file structure and stream descriptions). It is mostly useful for
+understanding what might be wrong with a PDF file.

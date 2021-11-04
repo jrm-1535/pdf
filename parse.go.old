@@ -1,0 +1,974 @@
+
+package pdf
+
+import (
+    "fmt"
+    "os"
+    "io"
+//    "bytes"
+
+    "strconv"
+    "strings"
+)
+
+const (
+    INPUT_BUFFER_SIZE = 1024*1024*4      // should be bigger than the max token size
+    DEFAULT_DICTIONARY_SIZE = 8          // by default a small size
+)
+
+type PdfFile struct {
+
+    Version     string
+    Header      string
+
+    Objects     []PdfObject              // objects in file offset order
+    ObjById     map[int64]*PdfObject     // objects direct access by ID
+
+    Catalog     *PdfObject
+    Encrypt     *PdfObject
+    Info        *PdfObject
+    Id          *PdfArray
+}
+
+type PdfObject struct {
+    id          int64
+    generation  int64
+    fileOffset  int64    // for XREF validation
+    value       interface{}
+}
+
+type fileInput struct {
+    fd          *os.File
+
+    pCount      int64   // count of all previous buffer bytes
+    buffer      []byte  // current read buffer
+    offset      int     // offset in current read buffer
+
+    // offset is always pointing after the content of bytes/token
+    bytes       []byte  // requested n binary bytes (not lines)
+    token       string  // current token in buffer
+    tokFilePos  int64   // current token position in file
+
+    // savedToken and savedOffset are used to restart with the
+    // previous token.
+    savedToken  string  // "" indicate no saved token
+    savedOffset int     // -1 indicate no saved token
+    savedPos    int64   // valid only if saved token is not ""
+}
+
+func (fi *fileInput) reportParseErrorf( format string, a ...interface{} ) {
+    fmt.Fprintf( os.Stderr, "Parse error around offset 0x%x: ", fi.pCount + int64(fi.offset) )
+    fmt.Fprintf( os.Stderr, format, a... ) 
+    os.Exit(1)
+}
+
+func (fi *fileInput) reportParseError( err error ) {
+    fmt.Fprintf( os.Stderr, "Parse error around offset 0x%x: %v", fi.pCount + int64(fi.offset), err )
+    os.Exit(1)
+}
+
+func (fi *fileInput)refill() error {
+
+    remaining := len(fi.buffer) - fi.offset
+    if remaining > 0 {
+        copy( fi.buffer[0:], fi.buffer[fi.offset:] )
+        fmt.Printf( "refill buffer, keeping last %d bytes: '%s'\n", remaining, fi.buffer[0:remaining] )
+    } else {
+        fmt.Printf( "refill buffer, whole buffer size (max 0x%x)\n", INPUT_BUFFER_SIZE )
+    }
+    tmpBuf := fi.buffer[remaining:]     // keep fi.buffer data ptr
+    n, err := fi.fd.Read( tmpBuf )
+    if err != nil {
+        if err != io.EOF { fi.reportParseError( err ) }
+        if remaining > 0 { err = nil }  // will be found next time
+    }
+    fi.buffer = fi.buffer[:remaining+n] // update fi.buffer len
+    fi.pCount += int64(fi.offset)
+    fi.offset = remaining
+    return err // nil or io.EOF
+}
+
+func (fi *fileInput)readNBytes( n int64 ) (res int64) {
+    if n == 0 {  return 0 }
+
+    // create new byte slice since requested length may be
+    // larger than a single fi buffer
+    fi.bytes = make( []byte, n )
+
+    bytes := fi.bytes
+    for {   // possibly across multiple buffers
+        end := int64( len(fi.buffer) )
+        remaining := end - int64( fi.offset )
+//        fmt.Printf( "requested %d, end %d, remaining %d, done %d\n", n, end, remaining, res )
+        if n - res <= remaining {
+            copy( bytes, fi.buffer[ fi.offset : fi.offset + int(n - res) ] )
+            fi.offset += int(n - res)
+            res = n
+            return res
+        }
+        res += remaining
+        copy( bytes, fi.buffer[ fi.offset : ] )
+        bytes = fi.bytes[ res : ]
+        fi.offset = int(end)
+        err := fi.refill()
+        if err != nil { return res } // truncated
+    }
+}
+
+func (fi *fileInput)readFirstLine( ) ( string, byte ) {
+
+    err := fi.refill()
+    if err != nil {
+        fi.reportParseErrorf("Empty file\n" )
+    }
+    end := len( fi.buffer )
+
+   // expects %PDF-1.?\n
+    if end < 9 || '%' != fi.buffer[0] ||
+       'P' != fi.buffer[1] || 'D' != fi.buffer[2] ||
+       'F' != fi.buffer[3] || '-' != fi.buffer[4] ||
+       '1' != fi.buffer[5] || '.' != fi.buffer[6] {
+        fi.reportParseErrorf("Not a PDF document\n")
+    }
+    minor := fi.buffer[7]
+    lineLen := 9
+    switch fi.buffer[ 8 ] {
+    case 0x0d:
+        next := fi.buffer[ 9 ]           // peek next byte
+        if next == 0x0a { lineLen = 10 } // skip terminating LF
+    case 0x0a:  // as expected, do nothing
+    default:
+        fi.reportParseErrorf("Invalid file header\n")
+    }
+    fi.offset = lineLen
+    return string(fi.buffer[:8]), minor - 0x30
+}
+
+func (fi *fileInput)skipCurrentLF( ) bool {
+    for {
+        if fi.offset < len( fi.buffer ) {
+            if fi.buffer[fi.offset] == '\n' {
+                fi.offset ++
+                return true
+            }
+            return false
+        }
+        err := fi.refill( )
+        if err != nil { fi.reportParseErrorf( "Premature EOF (expecting LF)\n" ) }
+    }
+}
+
+func (fi *fileInput)skipCurrentEOL( crLf bool ) bool {
+    for {
+        if fi.offset < len( fi.buffer ) {
+            c := fi.buffer[fi.offset]
+            switch c {
+            case '\r':
+                if crLf { // must be followed by \n'
+                    fi.offset ++
+                    return fi.skipCurrentLF()
+                }
+                return true
+            case '\n':
+                fi.offset ++
+                return true
+            default:
+                return false
+            }
+        }
+        err := fi.refill( )
+        if err != nil { fi.reportParseErrorf( "Premature EOF (expecting EOL)\n" ) }
+    }
+}
+
+// skip multiple spaces and commments (%...\n)
+func (fi *fileInput)skipSpaces( noComment bool ) {
+    end := len( fi.buffer )
+    inComment := false
+    for {   // possbly across multiple buffers
+        i := fi.offset
+        for ; i < end; i ++ {
+            switch fi.buffer[i] {
+            case  '\n', '\r':
+                inComment = false
+            case ' ', '\t', '\f' :             // keep moving
+            case '%':
+                if noComment {
+                    fi.offset = i              // stop right here
+                    return
+                }
+                inComment = true           // in comment
+            default:
+                if inComment { continue }      // if comment skip
+                fi.offset = i                  // else stop right here
+                return
+            }
+        }
+        fi.offset = i       // reached the end of current buffer
+        err := fi.refill()  // get the next buffer, and continue
+        if err != nil { fi.reportParseErrorf("Premature end of file (expecting space separator)\n") }
+        end = len( fi.buffer )
+    }
+}
+
+// skip the recommended binary comment following the PDF header
+// if any, and all following spaces. The next byte in the buffer
+// is the beginning of the objects in the file body.
+func (fi *fileInput)skipBinaryComment( ) {
+    end := len( fi.buffer )
+    if i := fi.offset; i < end - 5 { // required final eofComment is also 5 chars
+        if fi.buffer[ i ] != '%' || fi.buffer[ i+1 ] < 0x80 || fi.buffer[ i+2 ] < 0x80 ||
+           fi.buffer[ i+3 ] < 0x80 || fi.buffer[ i+4 ] < 0x80 {
+            fmt.Printf( "Warning: recommended binary comment is missing\n" )
+            return
+        }
+        fi.offset = i + 5
+        return
+    }
+    fi.reportParseErrorf( "End of PDF file without content\n" )
+}
+
+func (fi *fileInput)eofComment( ) bool {
+//    fmt.Printf( "EOF Comment: %s\n", string(fi.buffer[fi.offset:]) )
+    i := fi.offset
+    if fi.buffer[ i ] != '%' || fi.buffer[ i+1 ] != '%' || fi.buffer[ i+2 ] != 'E' ||
+       fi.buffer[ i+3 ] != 'O' || fi.buffer[ i+4 ] != 'F' { return false }
+    return true
+}
+
+func (pf *PdfFile) parseHeader( fi *fileInput ) {
+
+    var minor byte
+    pf.Header, minor = fi.readFirstLine()
+    pf.Version = fmt.Sprintf( "1.%d", minor )
+    fi.skipBinaryComment( )
+}
+
+type pdfBool    struct {
+    val     bool
+}
+
+type pdfNumber    struct {
+    val    float64
+}
+
+type pdfString  struct {
+    val     string
+}
+
+type pdfHexString   struct {
+    val     string
+}
+
+type pdfName    struct {
+    val     string
+}
+
+type pdfDictionary  struct {
+    keys    []string                // (file) ordered list of map keys
+    val     map[string]interface{}
+}
+
+type pdfStream  struct {
+    extent  pdfDictionary
+    val     []byte
+}
+
+type PdfArray   struct {
+    val     []interface{}
+}
+
+type pdfNull    struct {
+}
+
+type pdfReference struct {
+    number      int64
+    generation  int64
+}
+
+func (fi *fileInput)getTokenFilePos( ) int64 {
+    return fi.pCount + int64(fi.offset)
+}
+// tokenize the buffer, moves offset to after space(s) following token
+func (fi *fileInput)nextToken( ) {
+    var sb strings.Builder
+
+    fi.skipSpaces( false )     // skip spaces and comments
+    if fi.savedOffset != -1 {  // update saved offset after skipping spaces
+        fi.savedOffset = fi.offset  // as the buffer may have new content
+    }
+
+    i := fi.offset
+    fi.tokFilePos = fi.getTokenFilePos() // token starts here
+    end := len( fi.buffer )
+
+    // make sure '[', ']' or '(' are seen as separate tokens
+    if i < end && ( fi.buffer[ i ] == '[' ||
+                    fi.buffer[ i ] == ']' ||
+                    fi.buffer[ i ] == '(' ) {
+        fi.offset = i + 1
+        fi.token = string(fi.buffer[ i ])
+        return
+    }
+    for {   // possibly across multiple buffers
+        for ; i < end; i++ {
+            b := fi.buffer[ i ]
+            switch b {
+            // ends at first space, '[' or ']'
+            case 0x0d, 0x0a, 0x00, 0x09, 0x0c, 0x20, '%', '[', ']', '(' :
+                fi.offset = i
+                fi.token = sb.String()
+                return
+            }
+            sb.WriteByte( b )
+        }
+        // token does not seem to end in current buffer.
+        // make sure the beginning of token is still in buffer after refill
+        // so that it can be retrieved after restoring a saved token.
+        // refill takes care of moving data from fi.offset to buffer end
+        // at the head of the new buffer before filling the rest of the
+        // buffer with new data.
+        err := fi.refill( )
+        if err != nil { fi.reportParseErrorf( "end of file within token (%s)\n", sb.String() ) }
+        i = sb.Len()                // resume token where we stopped
+        end = len( fi.buffer )
+        if fi.savedOffset != -1 {   // update saved offset after refill
+//fmt.Printf( "Fixing saved offset from 0x%x to 0X0\n", fi.savedOffset )
+            fi.savedOffset = 0      // to point to the beginning of new token
+        }
+    }
+ }
+
+// save the current token, before looking ahead to the next token
+// works only for 1 token lookahead
+func (fi *fileInput)saveCurrentToken() {
+//    fmt.Printf( "save current token '%s' offset 0x%x\n", fi.token, fi.offset )
+    fi.savedToken = fi.token
+    fi.savedPos = fi.tokFilePos
+    fi.savedOffset = fi.offset  // points to space ahead of next token
+}
+
+// restore the saved token, after looking ahead to the next token
+func (fi *fileInput)restoreCurrentToken() {
+    fi.token = fi.savedToken
+    fi.tokFilePos = fi.savedPos
+    fi.offset = fi.savedOffset   // may have been updated by nextToken
+    fi.savedToken = ""
+    fi.savedOffset = -1
+//    fmt.Printf( "restore current token '%s' offset 0x%x\n", fi.token, fi.offset )
+}
+
+func checkObjType( fi *fileInput, expected string ) {
+    if fi.token != expected {
+        fi.reportParseErrorf( "Not an object: %s\n", fi.token )
+    }
+    fi.nextToken()
+}
+
+func (fi *fileInput)getByte( ) byte {
+
+    if fi.offset < len( fi.buffer ) {
+        c := fi.buffer[ fi.offset ]
+        fi.offset++
+        return c
+    }
+    err := fi.refill()
+    if err != nil { return 0x0a }
+    return fi.getByte()
+}
+
+// Undo getByte by decrementing fi.offset
+// It is only guaranteed to work once, and only after calling getByte
+// since the same buffer was used to return the byte to push back.
+// (at worst getByte did a refill just before returning the first byte
+// and fi.offset is 1 when returning from getByte)
+func (fi *fileInput)ungetByte( ) {
+    fi.offset --
+}
+
+// consumes from 0 byte to 3 bytes
+func getEscapeSeq( fi *fileInput ) ( int, byte ) {
+
+    switch c := fi.getByte( ); c {
+    case 'n':  return 1, 0x0a
+    case 'r':  return 1, 0x0d
+    case 't':  return 1, 0x09
+    case 'b':  return 1, 0x08
+    case 'f':  return 1, 0x0c
+    case '(':  return 1, 0x28
+    case ')':  return 1, 0x29
+    case '\\':  return 1, 0x5c
+    default:    // octal number
+        var v byte
+        if c < 0x30 || c > 0x37 {
+            fi.ungetByte()
+            return 0, v
+        }
+        v = c - 0x30
+        c = fi.getByte( )
+        if c < 0x30 || c > 0x37 {
+            fi.ungetByte()
+            return 1, v
+        }
+        v <<= 3
+        v += c - 0x30
+        c = fi.getByte()
+        if c < 0x30 || c > 0x37 {
+            fi.ungetByte()
+            return 2, v
+        }
+        v <<= 3
+        return 3, v + c - 0x30
+    }
+}
+
+func getLiteralString( fi *fileInput ) pdfString {
+    var sb strings.Builder
+
+    openCount := 1
+    for {   // possibly across multiple buffers
+        end := len(fi.buffer)
+        for i := fi.offset; i < end; i++ {
+            switch c := fi.buffer[i]; c {
+            case '(':
+//                fmt.Printf("Seen '(', openCount=%d\n", openCount )
+                sb.WriteByte( c )
+                openCount ++
+            case ')':
+                fmt.Printf("Seen ')', openCount=%d\n", openCount )
+                openCount --
+                if openCount == 0 {     // end of string
+//                    fmt.Printf( "End of literal string, next=0x%x\n", i+1 )
+                    fi.offset = i + 1
+                    fi.nextToken()
+                    return pdfString{ sb.String() }
+                }
+                sb.WriteByte( c )
+            case '\\':
+                fi.offset = i + 1       // including '\\'
+                n, b := getEscapeSeq( fi )
+                end = len(fi.buffer)   // may have changed
+                if n > 0 {
+                    sb.WriteByte( b )
+                    i += n
+                }
+            default:
+                sb.WriteByte( c )
+            }
+        }
+        err := fi.refill()
+        if err != nil {
+            fi.reportParseErrorf( "End of file within a literal string (%s)\n", sb.String() )
+        }
+    }
+}
+
+func getStreamBytes( fi *fileInput, extent map[string]interface{} ) []byte {
+    if ! fi.skipCurrentEOL( true ) {
+        fi.reportParseErrorf( "Stream keyword without following EOL\n" )
+    }
+    n, ok := extent["Length"]; if ! ok {
+        fi.reportParseErrorf(  "Stream object without Length in dictionary (%v)\n", extent )
+    }
+    l := int64(n.(pdfNumber).val)
+// TODO: implement -fix everywhere
+//    pos := fi.Seek( 0, os.SEEK_CUR )
+    if actual := fi.readNBytes( l ); actual < l {
+        fi.reportParseErrorf( "Stream object with wrong length %d: remaining %d\n", l, actual )
+    }
+    if ! fi.skipCurrentEOL( false ) { // must be followed by end of line
+        fi.reportParseErrorf( "Stream object with wrong length %d: missing EOL\n", l ) 
+    }
+    fi.nextToken()
+    if fi.token != "endstream" {
+        fi.reportParseErrorf( "Stream object without 'endstream' or with wrong length %d: %s\n", l, fi.token )
+    }
+    fi.nextToken()
+    fmt.Printf( "getStreamBytes: followed by token '%s'\n", fi.token )
+    return fi.bytes
+}
+
+func getDictionaryOrStream( fi *fileInput ) interface{} {
+    k := make( []string, 0, DEFAULT_DICTIONARY_SIZE )
+    m := make( map[string]interface{} )
+//    fmt.Printf( "getDictionaryOrStream: before: '%s'\n", fi.token )
+    fi.nextToken() // skip "<<"
+//    fmt.Printf( "getDictionaryOrStream: token: '%s'\n", fi.token )
+    for {
+        if fi.token == ">>" {
+            fi.nextToken( )
+            if fi.token == "stream" { // stream must be followed by EOL
+                stream := getStreamBytes( fi, m )
+                return pdfStream{ extent: pdfDictionary{ k, m }, val: stream }
+            }
+            return pdfDictionary{ k, m }
+        }
+        // expect a name first
+        if fi.token[0] != '/' {
+            fi.reportParseErrorf( "Dictionary entry is not a name: %s\n", fi.token )
+        }
+        pName := getName( fi )
+        k = append( k, pName.val )
+        // then an object
+        m[pName.val] = getObjectDef( fi )
+    }
+}
+
+func getHexString( fi *fileInput ) pdfHexString {
+    var hsb strings.Builder
+    var nibble, c byte
+    // <xx..xx>
+//    fmt.Printf("HexString: %s\n", fi.token )
+    for i := 1; i < len( fi.token ); i++ {
+        c = fi.token[i]
+        // fmt.Printf( "Hex char: 0x%x\n", c )
+        if c == '>' { 
+            if i & 1 == 0 { // assume missing char is '0'
+                hsb.WriteByte( nibble << 4 )
+            }
+            break
+        }
+
+        if i & 1 == 1 {         // first nibble
+            nibble = makeNibbleFromHexChar( fi, c )
+        } else {                // second nibble
+            hsb.WriteByte( nibble << 4 + makeNibbleFromHexChar( fi, c ) )
+        }
+    }
+    fi.nextToken()
+    return pdfHexString{ hsb.String() }
+}
+
+func makeNibbleFromHexChar( fi *fileInput, c byte ) byte {
+    if c < 0x30 {
+        fi.reportParseErrorf( "Not an hexadecimal digit: 0x%x\n", c )
+    }
+    if c <= 0x39 {
+        return c - 0x30
+    }
+    c &^= 0x20
+    if c < 0x41 || c > 0x46 {
+        fi.reportParseErrorf( "Not an hexadecimal digit: 0x%x\n", c )
+    }
+    return c - 0x41 + 10    // A, B, C, D, E, F => 10, 11, 12, 13, 14, 15
+}
+
+func getName( fi *fileInput ) pdfName {
+    var name strings.Builder
+    token := fi.token
+//    fmt.Printf( "name token: '%s'\n", token )
+    for i := 1; i < len( token ); { // skip '/'
+        switch token[i] {
+        case '#':  // check for correctness but do not decode encoded name
+            if i + 2 >= len(token) {
+                fi.reportParseErrorf( "Incomplete # escape in name" )
+            }
+            name.WriteByte( '#' )
+            c := makeNibbleFromHexChar( fi, token[i+1] )
+            name.WriteByte( token[i+1] )
+            c <<= 4
+            c += makeNibbleFromHexChar( fi, token[i+2] )
+            name.WriteByte( token[i+2] )
+            i += 3
+        default:
+            name.WriteByte( token[i] )
+            i ++
+        }
+    }
+    fi.nextToken()
+    return pdfName{ name.String() }
+}
+
+func getArray( fi *fileInput ) PdfArray {
+    array := make( []interface{}, 0, 4 )   // expect mostly small arrays
+    fi.nextToken()
+    for {
+        if fi.token == "]" {
+            fi.nextToken()
+//            fmt.Printf( "Array: %v\n", array )
+            return PdfArray { array }
+        }
+//        fmt.Printf( "Array: token '%s'\n", fi.token )
+        array = append( array, getObjectDef( fi ) )
+    }
+}
+
+func getNumber( fi *fileInput ) pdfNumber {
+    rn, err := strconv.ParseFloat( fi.token, 64 )
+    if err != nil {
+        panic( fmt.Errorf( "Invalid floating point number %s\n", fi.token ) )
+    }
+    fi.nextToken()
+    return pdfNumber { rn }
+}
+
+func getPositiveInteger( token string ) (int64, bool) {
+    if ( token[0] < '0' || token[0] > '9' ) && token[0] != '+' {
+//        fmt.Printf( "getPositiveInteger: illegal char 0x%x (%s)\n", token[0], token )
+        return 0, false
+    }
+    in, err := strconv.ParseInt( token, 10, 32 )
+    if err != nil {
+//        fmt.Printf( "getPositiveInteger: error %v\n", err )
+        return 0, false
+    }
+    return in, true
+}
+
+func getNumberOrObjRef( fi *fileInput ) interface{} {
+    // either single number (+/-n.m) or object reference (n g R)
+    // fi.token is the first number, it may be followed by an 
+    // another number and then byt 'R'. If yes, the result is
+    // an object reference. If not, the result is the first
+    // number and the 2 following objects are stored in a
+    // lookahead buffer.
+//    fmt.Printf("getNumberOrObjRef: token: '%s' @0x%x\n", fi.token, fi.offset )
+    id, ok := getPositiveInteger( fi.token )
+    if ! ok { // not an integer, may be a real number
+//        fmt.Printf( "getNumberOrObjRef returns real number\n" )
+        return getNumber( fi )
+    }
+
+    fi.nextToken()
+//    fmt.Printf("getNumberOrObjRef: next token: '%s'\n", fi.token )
+    g, ok := getPositiveInteger( fi.token )
+    if ok {
+        fi.saveCurrentToken()
+        fi.nextToken()
+//        fmt.Printf("getNumberOrObjRef: next next token: '%s'\n", fi.token )
+        if fi.token == "R" {
+            fi.nextToken()
+//            fmt.Printf( "getNumberOrObjRef returns indirect reference %d %d with next token='%s'\n",
+//                         id, g, fi.token )
+            return pdfReference{ id, g }
+        }
+        fi.restoreCurrentToken()
+    }
+//    fmt.Printf( "getNumberOrObjRef returns single integer number %d with next token='%s'\n", id, fi.token )
+    return pdfNumber { float64( id ) }
+}
+
+func getIndirectObjectDef( fi *fileInput ) ( int64, int64 ) {
+
+    // assumes first token is ready
+    number, err := strconv.ParseInt( fi.token, 10, 64 )
+    if err != nil {
+        panic( fmt.Errorf( "Invalid indirect object number: %s : %v\n", fi.token, err ) )
+    }
+    fi.nextToken()
+    generation, err := strconv.ParseInt( fi.token, 10, 64 )
+    if err != nil {
+        panic( fmt.Errorf( "Invalid indirect object %d generation: %s : %v\n", number, fi.token, err ) )
+    }
+    fi.nextToken()
+    if fi.token != "obj" {
+        panic( fmt.Errorf( "invalid object %d generation %d syntax %s\n", number, generation, fi.token ) )
+    }
+    fi.nextToken()
+    return number, generation
+}
+
+func getObjectDef( fi *fileInput ) interface{} {
+    var result interface{}
+
+//    fmt.Printf( "getObjectDef: token: '%s'\n", fi.token )
+    switch fi.token[0] {
+    case 't':           // boolean
+        checkObjType( fi, "true" )
+        result = pdfBool{ true }
+    case 'f':           // boolean
+        checkObjType( fi, "false" )
+        result = pdfBool{ false }
+    case '(':           // string
+        result = getLiteralString( fi )
+    case '<':           // hex string or dictionary
+        if fi.token == "<<" {
+            result = getDictionaryOrStream( fi )
+        } else {
+            result = getHexString( fi )
+        }
+    case '/':           // name
+        result = getName( fi )
+    case '[':           // array
+        result = getArray( fi )
+    case 's':           // stream
+        checkObjType( fi, "stream" )
+        panic( "stream without dictionary and without length\n" )
+    case 'n':           // null
+        checkObjType( fi, "null" )
+        result = pdfNull{ }
+    case '-', '.' :     // negative number, either integer or real, or positive real number
+        result = getNumber( fi )
+    case '+':           // may be start of a positive number or integer in an object reference?
+        result = getNumberOrObjRef( fi )
+    default:            // may be start of a number or an object reference?
+        if fi.token[0] < '0' || fi.token[0] > '9' {
+            checkObjType( fi, "" )
+        }
+        result = getNumberOrObjRef( fi )
+    }
+    return result
+}
+
+func printPdfObj( obj interface{}, indent string ) {
+    switch obj := obj.(type) {
+    case pdfBool:
+        fmt.Printf("%s Bool %t\n", indent, obj.val )
+    case pdfNumber:
+        fmt.Printf("%s Number %g\n", indent, obj.val )
+    case pdfString:
+        fmt.Printf("%s String %s\n", indent, obj.val )
+    case pdfHexString:
+        fmt.Printf("%s Hex string 0x%x\n", indent, obj.val )
+    case pdfName:
+        fmt.Printf("%s Name %s\n", indent, obj.val )
+    case pdfDictionary:
+        fmt.Printf("%s Dictionary:\n", indent )
+        for k, v := range( obj.val ) {
+            fmt.Printf( "%s   %s: ", indent, k )
+            printPdfObj( v, indent + "  " )
+        }
+    case pdfStream:
+        fmt.Printf( "%s Stream extent:\n", indent )
+        printPdfObj( obj.extent, indent + "  " )
+        fmt.Printf( "%s Stream length: %d\n", indent, len( obj.val ) )
+    case PdfArray:
+        fmt.Printf("%s Array:\n", indent)
+        for i, v := range( obj.val ) {
+            fmt.Printf("%s   %d: ", indent, i )
+            printPdfObj( v, indent + "  " )
+        }
+    case pdfNull:
+        fmt.Printf( "%s Null", indent )
+    case pdfReference:
+        fmt.Printf( "%s Indirect object reference: number %d generation %d\n",
+                    indent, obj.number, obj.generation )
+    }
+}
+
+func (pf *PdfFile) parseObjects( fi *fileInput ) {
+    for {
+        fi.nextToken()
+// DEBUG
+//fmt.Printf( "indirect object new token %s position 0x%x\n", fi.token, fi.tokFilePos )
+//fmt.Printf( "new object buffer offset %d, end buffer 0x%x\n", fi.offset, len( fi.buffer ) )
+// END DEBUG
+//        fmt.Printf( "Parsing 1 indirect object, First token: %s\n", fi.token )
+        // expect an indirect object definition: nnn mm obj\n
+        if fi.token == "" {
+            panic( "End of PDF file without cross reference table or trailer\n" )
+        }
+        if fi.token == "xref" {
+            return
+        }
+
+        offset := fi.tokFilePos
+        number, gen := getIndirectObjectDef( fi )
+        fmt.Printf( "Indirect Object %d %d, offset: 0x%x\n", number, gen, offset )
+// DEBUG
+// if number == 10952 {
+//    panic ( "stop\n" )
+//}
+// END DEBUG
+        objDef := PdfObject{ id: number, generation: gen, fileOffset: offset }
+        obj := getObjectDef( fi )
+        if fi.token != "endobj" {
+            panic( fmt.Errorf( "Indirect Object %d %d does not end with 'endobj': %s\n", number, gen, fi.token ) )
+        }
+
+        objDef.value = obj
+//        printPdfObj( obj, "" )
+        pf.Objects = append( pf.Objects, objDef )
+        pf.ObjById[ number ] = &objDef       // direct access by ID
+    }
+}
+
+func (pf *PdfFile) parseXrefSubsection( fi *fileInput, start, number int64 ) {
+    fmt.Printf( "XEF subsection [%d:%d] (included)\n", start, start + number -1 )
+    for i:= int64(0); i < number; i++ {
+        if n := fi.readNBytes( 20 ); n != 20 {
+            panic( fmt.Errorf( "XREF subsection corrupted @offset 0x%x prev count 0x%%x read %d\n",
+                               fi.offset, fi.pCount, n ) )
+        }
+        os := string(fi.bytes[:10])
+        offset, ok := getPositiveInteger( os )
+        if ! ok {
+            panic( fmt.Errorf( "Incorrect offset %s\n", os ) )
+        }
+        if fi.bytes[10] != ' ' {
+            panic( fmt.Errorf( "Incorrect offset separator 0x%x\n", fi.bytes[10] ) )
+        }
+        gs := string(fi.bytes[11:16])
+        gnumber, ok := getPositiveInteger( gs )
+        if ! ok {
+            panic( fmt.Errorf( "Incorrect generation number %s\n", gs ) )
+        }
+        if fi.bytes[16] != ' ' {
+            panic( fmt.Errorf( "Incorrect generation separator 0x%x\n", fi.bytes[16] ) )
+        }
+        var inUse bool
+        switch fi.bytes[17] {
+        case 'n':
+            inUse = true
+            fmt.Printf( "XREF object ID %d offset: 0x%x for generation %d in use\n", i, offset, gnumber )
+        case 'f':
+            inUse = false
+            fmt.Printf( "XREF object ID %d offset: 0x%x for generation %d free\n", i, offset, gnumber )
+        default:
+            panic( fmt.Errorf( "Incorrect XREF keyword 0x%x\n", fi.bytes[17] ) )
+        }
+        if fi.bytes[18] != ' ' {
+            if fi.bytes[18] != '\r' || fi.bytes[19] != '\n' {
+                panic( fmt.Errorf( "invalid end of line 0x%x%x\n", fi.bytes[18], fi.bytes[19] ) )
+            }
+        } else {
+            if fi.bytes[19] != '\r' && fi.bytes[19] != '\n' {
+                panic( fmt.Errorf( "invalid end of line 0x%x%x\n", fi.bytes[18], fi.bytes[19] ) )
+            }
+        }
+        var obj *PdfObject
+        if obj, ok = pf.ObjById[i]; !ok {
+            if inUse {
+                panic( fmt.Errorf( "XREF Object ID %d @offset 0x%x is unknown\n", i, offset ) )
+            } else {
+                fmt.Printf( "Warning: free XREF Object ID %d @offset 0x%x is unknown\n", i, offset )
+            }
+        } else {
+            if obj.fileOffset != offset {
+                panic( fmt.Errorf( "XREF Object ID %d @offset 0x%x is known at offset 0x%x\n",
+                       i, offset, obj.fileOffset ) )
+            }
+        }
+    }
+}
+
+func (pf *PdfFile) parseXrefTable( fi *fileInput ) {
+    // cross-reference table is made of multiple xref sections
+    // each xref section is made of 1 or more subsections
+    // subsection: 1 line with 2 integers: start space number eol
+    for {
+        if fi.token != "xref" { return }
+        fi.nextToken( )
+        start, ok := getPositiveInteger( fi.token )
+        if ! ok {
+            panic( fmt.Errorf( "Incorrect xref section: start %s\n", fi.token ) )
+        }
+        fi.nextToken( )
+        number, ok := getPositiveInteger( fi.token )
+        if ! ok {
+            panic( fmt.Errorf( "Incorrect xref section: number %s\n", fi.token ) )
+        }
+        fi.skipSpaces( false )     // skip spaces and comments
+        pf.parseXrefSubsection( fi, start, number )
+        fi.nextToken()
+    }
+}
+
+func (pf *PdfFile) getObjFromTrailer( dic pdfDictionary, key string ) *PdfObject {
+    if v, ok := dic.val[ key ]; ok {
+        if v, ok := v.(pdfReference); ok {
+            if obj, ok := pf.ObjById[ v.number ]; ok {
+                return obj
+            }
+        }
+    }
+    return nil
+}
+
+func (pf *PdfFile) parseTrailer( fi *fileInput ) {
+    if fi.token != "trailer" {
+        panic( fmt.Errorf( "No trailer found: %s\n", fi.token ) )
+    }
+    fi.nextToken( )
+    if fi.token != "<<" {
+        panic( fmt.Errorf( "Trailer does not have a dictionary: %s\n", fi.token ) )
+    }
+    dos := getDictionaryOrStream( fi )
+    dic, ok := dos.(pdfDictionary)
+    if ! ok {
+        panic( fmt.Errorf( "Trailer does not have a dictionary (unexpected stream)\n" ) )
+    }
+    printPdfObj( dic, "  " )
+    
+    if v := pf.getObjFromTrailer( dic, "Root" ); v != nil { pf.Catalog = v }
+    if v := pf.getObjFromTrailer( dic, "Encrypt" ); v != nil {
+        pf.Encrypt = v
+// DEBUG: See the indirect reference
+        fmt.Printf( "Encrypt object ID %d gen %d\n", v.id, v.generation )
+        dic := v.value.(pdfDictionary)
+        for k, v := range dic.val {
+            if k == "O" || k == "U" {
+                fmt.Printf( "%s=%x\n", k, v )
+            } else {
+                fmt.Printf( "%s=%v\n", k, v )
+            }
+//            fmt.Printf( "%s=%v\n", k, v )
+        }
+    }
+    if v := pf.getObjFromTrailer( dic, "Info" ); v != nil {
+        pf.Info = v
+// DEBUG: See the indirect reference
+//        fmt.Printf( "Info object ID %d gen %d\n", v.id, v.generation )
+//        infoDic := v.value.(pdfDictionary)
+//        for k, v := range infoDic.val {
+//            fmt.Printf( "%s=%v\n", k, v )
+//        }
+    }
+
+    if pa, ok := dic.val[ "ID" ]; ok {
+        if v, ok := pa.(PdfArray); ok {
+            pf.Id = &v
+            a := v.val
+            Id0, ok := a[0].(pdfHexString)
+            if ! ok { fi.reportParseErrorf( "ID #0 is not an hexString: %v\n", a[0] ) }
+            Id1, ok := a[1].(pdfHexString)
+            if ! ok { fi.reportParseErrorf( "ID #1 is not an hexString: %v\n", a[1] ) }
+            fmt.Printf( "IDs: <%x> <%x>\n", Id0, Id1 )
+        }
+    }
+
+    if fi.token != "startxref" {
+        panic( fmt.Errorf( "Trailer does not have a start xref: %s\n", fi.token ) )
+    }
+    fi.nextToken( )
+    xrefOffset, ok := getPositiveInteger( fi.token )
+    if ! ok {
+        panic( fmt.Errorf( "Trailer does not have a valid start xref offset: %s\n", fi.token ) )
+    }
+    fmt.Printf("Start XREF offset: %d (0x%x)\n", xrefOffset, xrefOffset )
+    fi.skipSpaces( true )     // skip spaces but not comments
+    if ! fi.eofComment( ) {
+        panic( "Trailer does not have a correct EOF\n" )
+    }
+}
+
+func (fi *fileInput) parse( ) *PdfFile {
+    pf := new( PdfFile )
+    pf.ObjById = make( map[int64]*PdfObject )
+    pf.parseHeader( fi )
+    pf.parseObjects( fi )
+    pf.parseXrefTable( fi )
+    pf.parseTrailer( fi )
+    return pf
+}
+
+func newFileInput( fd *os.File ) *fileInput {
+    var fi fileInput
+    fi.fd = fd
+    fi.pCount = -INPUT_BUFFER_SIZE      // init to - 1 buffer size so that first refill makes it 0
+    fi.buffer = make( []byte, INPUT_BUFFER_SIZE )
+    fi.offset = len( fi.buffer )        // init to end of buffer to force a first refill
+    return &fi
+}
+
+func File( path string ) *PdfFile {
+    fd, err := os.Open( path )
+    if err != nil {
+		fmt.Printf( "File: unable to read file %s: %v\n", path, err )
+        return nil
+	}
+    fi := newFileInput( fd )
+    pdf := fi.parse( )
+    fd.Close()
+    return pdf
+}
