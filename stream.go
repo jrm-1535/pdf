@@ -3,7 +3,7 @@ package pdf
 
 import (
     "fmt"
-    "jpeg"
+    "github.com/jrm-1535/jpeg"
 )
 
 func checkASCIIHexDecode( data []byte, verbose, fix bool ) ([]byte, error) {
@@ -132,7 +132,7 @@ decodeLoop:
                 return output[0:dl], fmt.Errorf( "Invalid ASCII 85 encoding (beyond 2^32 -1) in last group\n" )
             }
             for i := 0; i < gi-1; i++ {
-                output[dl] = byte( 0xff & ( n64 >> ( 24 - i * 8 ) ) )
+                output[dl] = byte( 0xff & ( n64 >> uint( 24 - i * 8 ) ) )
                 dl++
             }
         }

@@ -850,7 +850,7 @@ func getObjectDef( fi *fileInput, stop int64 ) ( interface{}, error ) {
     var result interface{}
     var err error = nil
     if stop != -1 && stop <= fi.getFilePos() {
-        panic( fmt.Sprintf( "Reached the end of parent object before ending (stop 0x%x, current 0x%x)\n", stop, fi.getFilePos() ) )
+//        panic( fmt.Sprintf( "Reached the end of parent object before ending (stop 0x%x, current 0x%x)\n", stop, fi.getFilePos() ) )
         return nil, fi.parseErrorf( "Reached the end of parent object before ending (0x%x)\n", stop )
     }
 //    fmt.Printf( "getObjectDef: token: '%s'\n", fi.token )
@@ -949,7 +949,7 @@ func (pf *PdfFile) parseObjects( fi *fileInput, objStart, objEnd int64 ) error {
 // END DEBUG
 //        fmt.Printf( "Parsing 1 indirect object, First token: %s\n", fi.token )
         // expect an indirect object definition: nnn mm obj\n
-        if fi.token == "" || fi.token == "xref" { return nil }
+        if fi.token == "" || fi.token == "xref" { break }
 
         offset := fi.tokFilePos
         id, gen, err := getIndirectObjectDef( fi )
