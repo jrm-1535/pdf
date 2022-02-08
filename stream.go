@@ -192,21 +192,28 @@ func checkCCITTFaxDecode( data []byte, parameters map[string]interface{}, verbos
 }
 
 
-func checkDCTDecode( data []byte, verbose, fix bool ) ([]byte, jpeg.Metadata, error) {
+func checkDCTDecode( data []byte, verbose, fix bool ) ([]byte, *jpeg.FrameInfo, error) {
 
     // DCTDecode (JPEG) should be the last decoder in any sequence of decoders
     // since the decompressed data is an image to present.
     if verbose {
         fmt.Printf( "checkDCTDecode first 4 bytes 0x%x\n", string(data[0:4]) )
     }
-    var control jpeg.Control = jpeg.Control{ Content:verbose, Fix:fix }
-    jpg, err := jpeg.Analyze( data, &control )
+    var control jpeg.Control = jpeg.Control{ Warn:verbose, TidyUp:fix }
+    jpg, err := jpeg.Parse( data, &control )
     if err != nil {
-        return []byte{}, jpeg.Metadata{}, err
+        return []byte{}, nil, err
     }
 
     if jpg == nil || ! jpg.IsComplete( ) {
-        return []byte{}, jpeg.Metadata{}, fmt.Errorf( "JPEG data cannot be parsed\n" )
+        return []byte{}, nil, fmt.Errorf( "JPEG data cannot be parsed\n" )
+    }
+    if jpg.GetNumberOfFrames() != 1 {
+        return []byte{}, nil, fmt.Errorf( "JPEG data does not contain one frame\n" )
+    }
+    var frameInfo *jpeg.FrameInfo
+    if frameInfo, err = jpg.GetFrameInfo( 0 ); err != nil {
+        return []byte{}, frameInfo, err
     }
 
     actualL, dataL := jpg.GetActualLengths()
@@ -221,7 +228,7 @@ func checkDCTDecode( data []byte, verbose, fix bool ) ([]byte, jpeg.Metadata, er
             fmt.Printf( "Fixing jpeg stream (len=%d)\n", len(data) )
         }
     }
-    return data, jpg.GetMetadata(), err
+    return data, frameInfo, err
 }
 
 func makeOneElementArray( element interface{} ) *PdfArray {
@@ -271,7 +278,7 @@ func checkStream( stream *pdfStream, verbose, fix bool ) error {
             var err error
             switch v.(pdfName) {
             case "DCTDecode":
-                var meta jpeg.Metadata
+                var meta *jpeg.FrameInfo
                 data, meta, err = checkDCTDecode( data, verbose, fix )
                 if err == nil && fix {  // update stream if jpeg could have fixed it
 //                    fmt.Printf( "Meta bpc=%d, w=%d h=%d\n", meta.SampleSize, meta.Width, meta.Height )
