@@ -2,3 +2,5 @@ github.com/jrm-1535/exif v0.0.0-20220207234711-36984fb318e8 h1:UJSIhAfWDnqPrvIUF
 github.com/jrm-1535/exif v0.0.0-20220207234711-36984fb318e8/go.mod h1:0DD4FTVvmB+ajFzznyJ1f9diIcldKIZwCx+dq2aNJr4=
 github.com/jrm-1535/jpeg v0.0.0-20220209054657-8a1a41b5b727 h1:+4Ozo+2KEwtAvTbAfQwkZBcWINpyKI6uL4MYRZGUQ8M=
 github.com/jrm-1535/jpeg v0.0.0-20220209054657-8a1a41b5b727/go.mod h1:QjjlAwW9YLNnTbSYRHcQDFHslh46+RpL1KeqYTMS61M=
+github.com/jrm-1535/jpeg v0.0.0-20220210045643-56cb8b96fc72 h1:u6M7yn7rDie62zr0b8I0aTZ9ncitMJ3zbn9AbZO4AG0=
+github.com/jrm-1535/jpeg v0.0.0-20220210045643-56cb8b96fc72/go.mod h1:QjjlAwW9YLNnTbSYRHcQDFHslh46+RpL1KeqYTMS61M=
