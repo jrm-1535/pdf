@@ -312,9 +312,6 @@ func (pf *PdfFile)CheckStreams( verbose, fix bool ) error {
             }
             err := checkStream( &stream, verbose, fix )
             if err != nil {
-                if verbose {
-                    fmt.Printf( ">>> Error: %v", err )
-                }
                 return err
             }
             objPtr.value = stream   // checkStream may have modified the stream

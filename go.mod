@@ -2,6 +2,6 @@ module github.com/jrm-1535/pdf
 
 go 1.17
 
-require github.com/jrm-1535/jpeg v0.0.0-20220210045643-56cb8b96fc72
+require github.com/jrm-1535/jpeg v0.0.0-20220725033137-d4277bf587a2
 
-require github.com/jrm-1535/exif v0.0.0-20220207234711-36984fb318e8 // indirect
+require github.com/jrm-1535/exif v0.0.0-20220401231744-7eff3a0c91ba // indirect
